@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from dotenv import load_dotenv
 import os
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -43,12 +44,10 @@ if 'logs' not in st.session_state:
     st.session_state.logs = ""
 log_placeholder = st.empty()
 
-# Function to update Streamlit log
 def update_log(message):
     st.session_state.logs += message + "\n"
     log_placeholder.text_area("Logs", st.session_state.logs, height=300)
 
-# Cached function to generate embeddings
 @lru_cache(maxsize=1000)
 def get_embedding(text):
     try:
@@ -58,7 +57,6 @@ def get_embedding(text):
         logger.error(f"Error generating embedding: {e}")
         return None
 
-# Function to create embeddings
 def create_embeddings(df):
     records = []
     for i, row in df.iterrows():
@@ -68,7 +66,6 @@ def create_embeddings(df):
             records.append((str(i), embedding, {"text": text}))
     return records
 
-# Function to upload data to Pinecone
 def upload_to_pinecone(records):
     try:
         if index_name not in pc.list_indexes().names():
@@ -90,7 +87,6 @@ def upload_to_pinecone(records):
         logger.error(f"Error uploading to Pinecone: {e}")
         return False, f"Error uploading data to Pinecone: {str(e)}"
 
-# Function to query Pinecone and format response
 async def query_pinecone(query):
     try:
         index = pc.Index(index_name)
@@ -107,137 +103,208 @@ async def query_pinecone(query):
         logger.error(f"Error querying Pinecone: {e}")
     return None
 
-# Function to extract date from query
-def extract_date_from_query(query):
-    # First, look for DD-MM-YYYY format
-    import re
-    date_pattern = r'\d{2}-\d{2}-\d{4}'
-    matches = re.findall(date_pattern, query)
-    if matches:
-        return matches[0]
-    
-    # Look for specific date mentions
-    words = query.split()
-    for word in words:
-        if word.replace('th','').replace('st','').replace('nd','').replace('rd','').isdigit():
-            # If found a day number, convert it to proper format
-            try:
-                day = int(word.replace('th','').replace('st','').replace('nd','').replace('rd',''))
-                current_date = datetime.now()
-                return current_date.replace(day=day).strftime('%d-%m-%Y')
-            except ValueError:
-                continue
-    
-    # If no date found, return today's date
-    return datetime.now().strftime('%d-%m-%Y')
-
-# Function to extract name from query
-def extract_name_from_query(query):
-    # Split query into words and look for name
-    words = query.lower().split()
-    # Skip common words
-    skip_words = {'is', 'has', 'leave', 'on', 'why', 'taking', 'today', 'tomorrow', 'yesterday'}
-    for word in words:
-        if word not in skip_words and not any(char.isdigit() for char in word):
-            return word.capitalize()
-    return None
-
-# Improved query_gpt function
-async def query_gpt(query, context):
+async def analyze_query(query):
+    """Pre-process and analyze the query to determine intent and extract key information"""
     try:
-        today = datetime.now().strftime("%d-%m-%Y")
-        
         messages = [
-            {"role": "system", "content": f"""You are LeaveBuddy, an efficient AI assistant for employee leave information. Today is {today}. Follow these rules strictly:
+            {"role": "system", "content": """You are a leave management query analyzer. Extract key information from queries.
 
-1. Provide concise, direct answers about employee leaves.
-2. provide processing message for every request of the user.
-3. Always mention specific dates in your responses.
-4. For queries about total leave days, use this format:
-   [Employee Name] has [X] total leave days in [Year]:
-   - [Date]: [Reason]
-   - [Date]: [Reason]
-   ...
-   Total: [X] days
-5. For presence queries:
-   - If leave information is found for the date, respond with: if the information is found that person will not appear on that day
-     "[Employee Name] is present on [Date]. Reason: [Leave Reason]"
-   - If no leave information is found for the date, respond with:if the information is not found that person should appear on that day
-     "[Employee Name] is   not present on [Date]."
-6. IMPORTANT: Absence of leave information in the database means the employee is present.
-7. Only mention leave information if it's explicitly stated in the context.
-8. Limit responses to essential information only.
-9. Do not add any explanations or pleasantries.
-10. in final answer check again in DB is it correct ?
-11. if the question is overall like example : is anyboday leave today ?
-    - check the date in DB and give the solution"""},
-            {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
+TASK: Analyze the query and output in JSON format with these fields:
+{
+    "intent": "status|reason|period",
+    "name": "employee name",
+    "date": "DD-MM-YYYY",
+    "formatted_query": "standardized query"
+}
+
+EXAMPLES:
+
+Query: "is kumar on leave today"
+{
+    "intent": "status",
+    "name": "Kumar",
+    "date": "25-10-2024",
+    "formatted_query": "check Kumar leave status for 25-10-2024"
+}
+
+Query: "why is raj taking leave tomorrow"
+{
+    "intent": "reason",
+    "name": "Raj",
+    "date": "26-10-2024",
+    "formatted_query": "check Raj leave reason for 26-10-2024"
+}
+
+RULES:
+1. Convert all dates to DD-MM-YYYY format
+2. Capitalize names
+3. Never add information not in query
+4. Format dates: today → current date, tomorrow → next date"""},
+            {"role": "user", "content": query}
         ]
         
         response = await openai.ChatCompletion.acreate(
             model="gpt-4o-mini",
             messages=messages,
             max_tokens=150,
-            n=1,
-            temperature=0.3,
+            temperature=0.1
         )
         return response.choices[0].message['content'].strip()
     except Exception as e:
-        logger.error(f"Error querying GPT: {e}")
-        return f"Error: Unable to process the query. Please try again."
+        logger.error(f"Error analyzing query: {e}")
+        return None
 
-# Improved process_query function
+async def generate_response(query_info, context):
+    """Generate response based on analyzed query and context"""
+    try:
+        messages = [
+            {"role": "system", "content": """You are a leave management assistant specialized in providing clear, accurate responses.
+
+CONTEXT RULES:
+1. Only use information explicitly stated in the context
+2. Never assume or add information
+3. If leave info exists in context → person is on leave
+4. If no leave info in context → person is not on leave
+
+RESPONSE FORMATS:
+
+1. For Status Queries:
+   Found in context:
+   → "[Name] will be on leave on [date] for [reason]"
+   Not found:
+   → "[Name] will be working on [date]"
+
+2. For Reason Queries:
+   Found in context:
+   → "[Name] has planned leave on [date] for [reason]"
+   Not found:
+   → "[Name] will be working on [date]"
+
+3. For Period Queries:
+   → List all leave dates found in context
+
+EXAMPLES:
+
+Context: "Kumar is on leave on 25-10-2024 (Friday) for Diwali"
+Query: Status check
+Response: "Kumar will be on leave on 25-10-2024 for Diwali"
+
+Context: No matching info
+Query: Status check
+Response: "Kumar will be working on 25-10-2024"
+
+KEY POINTS:
+- Use "will be on leave" for future dates
+- Use "is on leave" for current date
+- Use "will be working" when no leave found
+- Always include full date (DD-MM-YYYY)
+- Include exact reason if available
+- Keep responses concise and clear"""},
+            {"role": "user", "content": f"Query Info: {query_info}\nContext: {context}"}
+        ]
+        
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=150,
+            temperature=0.1
+        )
+        
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        logger.error(f"Error generating response: {e}")
+        return None
+
+async def validate_response(response, query_info, context):
+    """Validate and ensure response quality"""
+    try:
+        messages = [
+            {"role": "system", "content": """You are a response validator for leave management system. Ensure responses meet all criteria.
+
+VALIDATION RULES:
+
+1. Response Structure:
+   ✓ Contains employee name exactly as in query
+   ✓ Has date in DD-MM-YYYY format
+   ✓ Uses correct phrasing:
+     - "will be on leave" for future dates
+     - "is on leave" for current date
+     - "will be working" when no leave found
+   ✓ Includes reason when available
+
+2. Content Accuracy:
+   ✓ Matches context information exactly
+   ✓ No conflicting information
+   ✓ No missing required details
+
+3. Format Check:
+   For Leave Found:
+   → "[Name] will be on leave on [DD-MM-YYYY] for [reason]"
+   For No Leave:
+   → "[Name] will be working on [DD-MM-YYYY]"
+
+4. Fix Common Issues:
+   - Missing date → Add full date
+   - Wrong format → Standardize format
+   - Inconsistent status → Match context
+   - Missing reason → Add if available
+
+Return corrected response if needed."""},
+            {"role": "user", "content": f"Response: {response}\nQuery Info: {query_info}\nContext: {context}"}
+        ]
+        
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=150,
+            temperature=0.1
+        )
+        
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        logger.error(f"Error validating response: {e}")
+        return response
+
 async def process_query(query):
     try:
+        # Stage 1: Analyze query
+        query_info = await analyze_query(query)
+        logger.info(f"Query analysis: {query_info}")
+        
+        # Stage 2: Get context
         context = await query_pinecone(query)
-        name = extract_name_from_query(query)
-        date = extract_date_from_query(query)
         
-        if not name:
-            return "Please specify the employee name in your query."
-            
-        if context:
-            response = await query_gpt(query, context)
-        else:
-            response = f"{name} is not on leave on {date}."
-            
-        # Clean up response
-        response = response.replace("  ", " ").strip()
-        if response.lower().startswith("response:"):
-            response = response[9:].strip()
-            
-        return response
+        # Stage 3: Generate initial response
+        initial_response = await generate_response(query_info, context)
+        logger.info(f"Initial response: {initial_response}")
         
+        # Stage 4: Validate and format final response
+        final_response = await validate_response(initial_response, query_info, context)
+        logger.info(f"Final response: {final_response}")
+        
+        return final_response or "I apologize, but I couldn't process your query. Please try rephrasing it."
+            
     except Exception as e:
         logger.error(f"Error in process_query: {str(e)}")
         return "I encountered an error while processing your query. Please try again later."
 
-# Enhanced Slack event handler with fixed loading message
 @app.event("message")
 async def handle_message(event, say):
     try:
         text = event.get("text", "")
-        channel = event.get("channel", "")
-        
-        # Process the query
         response = await process_query(text)
-        
-        # Send the response
         await say(response)
-        
     except Exception as e:
         logger.error(f"Error in handle_message: {str(e)}")
         await say("I'm sorry, I encountered an error. Please try again.")
 
-# Function to run the Slack bot
 def run_slack_bot():
     async def start_bot():
         handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
         await handler.start_async()
-
     asyncio.run(start_bot())
 
-# Sidebar for optional data upload
+# Streamlit UI
 st.sidebar.header("Update Leave Data")
 uploaded_file = st.sidebar.file_uploader("Upload Excel file", type="xlsx")
 if uploaded_file is not None:
@@ -256,7 +323,6 @@ if uploaded_file is not None:
             st.session_state['data_uploaded'] = True
             st.sidebar.success("Data processed and uploaded successfully!")
 
-# Main interface for starting the Slack bot
 st.header("Slack Bot Controls")
 if 'bot_running' not in st.session_state:
     st.session_state.bot_running = False
@@ -271,6 +337,5 @@ if st.button("Start Slack Bot", disabled=st.session_state.bot_running):
 if st.session_state.bot_running:
     st.write("Slack bot is active and ready to answer queries.")
 
-# Run the Streamlit app
 if __name__ == "__main__":
     st.write("Leave Buddy is ready to use!")
