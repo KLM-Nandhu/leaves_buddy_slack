@@ -21,7 +21,6 @@ from langchain.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
 from langchain.callbacks.tracers import LangChainTracer
-from langchain.smith import RunEvalConfig
 from langchain.callbacks import tracing_enabled
 from langchain.callbacks.manager import CallbackManager
 
@@ -62,11 +61,12 @@ tracer = LangChainTracer(
     project_name="Leaves-Buddy"
 )
 
-# Initialize ChatOpenAI with tracing
+# Initialize ChatOpenAI with optimized settings
 llm = ChatOpenAI(
     model_name="gpt-4o-mini",
     temperature=0.1,
-    streaming=True,
+    streaming=False,
+    request_timeout=10,
     callback_manager=CallbackManager([tracer])
 )
 
@@ -82,7 +82,7 @@ class LeaveBot:
         self.initialize_state()
         self.setup_ui()
         self.setup_langchain()
-
+        
     def initialize_state(self):
         if 'bot_running' not in st.session_state:
             st.session_state.bot_running = False
@@ -101,32 +101,11 @@ class LeaveBot:
 
     def setup_langchain(self):
         self.prompt_template = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""You are LeaveBuddy, a precise leave management assistant. Today is {current_time}. Follow these rules exactly:
-
-1. RESPONSE STRUCTURE:
-   - Start with "🤖 Processing request..."
-   - Show time period
-   - List leaves chronologically
-   - Include total counts
-
-2. FORMATTING:
-   - Use DD-MM-YYYY for dates
-   - Include days of week
-   - Use emojis for clarity
-   - Separate past and future leaves
-
-3. SPECIAL CASES:
-   - Show "No leaves found" if none exist
-   - Mark overlapping leaves
-   - Note holidays and weekends
-
-4. ACCURACY:
-   - Verify all dates
-   - Double-check counts
-   - Ensure complete responses
-
-Context: {context}
-"""),
+            SystemMessage(content="""You are LeaveBuddy, a leave management assistant. Be direct and brief.
+1. For individual queries: State if person is on leave or present
+2. For multiple people: List each person's status
+3. Always verify dates
+4. Be concise"""),
             HumanMessage(content="{query}")
         ])
         
@@ -223,21 +202,13 @@ Context: {context}
             
             results = index.query(
                 vector=query_embedding,
-                top_k=15,
+                top_k=5,
                 include_metadata=True
             )
             
             if results['matches']:
-                matches = sorted(
-                    results['matches'],
-                    key=lambda x: datetime.strptime(x['metadata']['date'], '%d-%m-%Y')
-                )
-                
-                context_parts = []
-                for match in matches:
-                    context_parts.append(match['metadata']['text'])
-                
-                return " | ".join(context_parts)
+                context = " ".join([match['metadata']['text'] for match in results['matches']])
+                return context
             return None
         except Exception as e:
             logger.error(f"Pinecone query error: {e}")
@@ -245,69 +216,52 @@ Context: {context}
 
     async def query_gpt(self, query, context):
         try:
-            with tracing_enabled() as session:
-                inputs = {
-                    "query": query,
-                    "context": context,
-                    "current_time": datetime.now().strftime("%d-%m-%Y")
-                }
-                
-                response = await self.chain.arun(
-                    inputs,
-                    metadata={
-                        "conversation_id": str(session.id),
-                        "query_type": "leave_query",
-                        "has_context": bool(context)
-                    }
-                )
-                
-                return response.strip()
+            today = datetime.now().strftime("%d-%m-%Y")
+            
+            messages = [
+                {"role": "system", "content": """You are LeaveBuddy, a leave management assistant. Be direct and brief.
+1. For individual queries: State if person is on leave or present
+2. For multiple people: List each person's status
+3. Always verify dates in context
+4. Be concise"""},
+                {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
+            ]
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                max_tokens=150,
+                temperature=0.1,
+                presence_penalty=0.0,
+                frequency_penalty=0.0
+            )
+            return response.choices[0].message['content'].strip()
         except Exception as e:
             logger.error(f"GPT query error: {e}")
             return f"Error processing query. Please try again."
 
     async def process_query(self, query):
         try:
-            with tracing_enabled() as session:
-                logger.info(f"Processing query: {query}")
-                
-                metadata = {
-                    "conversation_id": str(session.id),
-                    "query_type": "leave_request",
-                    "timestamp": datetime.now().isoformat()
-                }
-                
-                context = await self.query_pinecone(query)
-                
-                if context:
-                    logger.info(f"Found context: {context[:200]}...")
-                    response = await self.query_gpt(query, context)
-                    metadata.update({
-                        "status": "success",
-                        "has_context": True
-                    })
-                    return response
-                else:
-                    name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
-                    if name_match:
-                        name = name_match.group(1)
-                        today = datetime.now().strftime("%d-%m-%Y")
-                        response = (
-                            f"🤖 Processing request...\n\n"
-                            f"📅 Date: {today}\n\n"
-                            f"RESULTS:\n"
-                            f"{name} is present today (no leave records found).\n\n"
-                            f"📊 Summary:\n"
-                            f"- No leave records found for specified date"
-                        )
-                        metadata.update({
-                            "status": "success",
-                            "has_context": False
-                        })
-                        return response
+            today = datetime.now().strftime("%d-%m-%Y")
+            
+            if query.lower().startswith("is "):
+                name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
+                if name_match:
+                    name = name_match.group(1)
+                    context = await self.query_pinecone(query)
+                    if context and name.lower() in context.lower():
+                        response = await self.query_gpt(query, context)
                     else:
-                        metadata["status"] = "invalid_query"
-                        return "Please provide a specific employee name or date for leave information."
+                        return f"{name} is present today (no leave records found)."
+                    return response
+
+            context = await self.query_pinecone(query)
+            if context:
+                response = await self.query_gpt(query, context)
+                return response
+            else:
+                return "No relevant leave information found."
+                
         except Exception as e:
             logger.error(f"Query processing error: {e}")
             return "An error occurred. Please try again."
@@ -321,11 +275,16 @@ Context: {context}
                 
                 processing_message = await app.client.chat_postMessage(
                     channel=channel,
-                    text="🤖 Processing your request... :hourglass_flowing_sand:"
+                    text="Processing..."
                 )
                 
-                self.update_log(f"New query: {text}")
-                response = await self.process_query(text)
+                try:
+                    response = await asyncio.wait_for(
+                        self.process_query(text),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    response = "Request timed out. Please try again."
                 
                 try:
                     await app.client.chat_update(
@@ -333,7 +292,6 @@ Context: {context}
                         ts=processing_message['ts'],
                         text=response
                     )
-                    self.update_log(f"Response sent: {response[:100]}...")
                 except SlackApiError as e:
                     logger.error(f"Slack API error: {e}")
                     await say(response)
@@ -341,7 +299,6 @@ Context: {context}
             except Exception as e:
                 error_msg = f"Message handling error: {str(e)}"
                 logger.error(error_msg)
-                self.update_log(error_msg)
                 await say("Sorry, I encountered an error. Please try again.")
 
     async def run_slack_bot(self):
@@ -425,60 +382,12 @@ Context: {context}
                 st.session_state.bot_running = False
                 self.update_log("Bot stopped by user")
                 st.warning("⚠️ Bot has been stopped")
-                st.experimental_rerun()
+                st.rerun()
 
-        # Bot status indicator
         if st.session_state.bot_running:
             st.success("🟢 Status: Active and ready for queries")
-            
-            # Display usage instructions
-            with st.expander("📖 Usage Instructions"):
-                st.markdown("""
-                ### How to Use Leave Buddy
-                
-                1. **Basic Queries**:
-                   - `is [name] on leave today?`
-                   - `when is [name]'s next leave?`
-                   - `show all leaves for [name]`
-                
-                2. **Multiple Employee Queries**:
-                   - `compare leaves for [name1] and [name2]`
-                   - `who is on leave today?`
-                   - `show all upcoming leaves`
-                
-                3. **Date-Specific Queries**:
-                   - `who is on leave on [date]?`
-                   - `show leaves in [month]`
-                   - `is anyone on leave next week?`
-                
-                4. **Statistical Queries**:
-                   - `how many leaves does [name] have?`
-                   - `show leave summary for team`
-                   - `who has the most leaves?`
-                """)
         else:
             st.warning("🔴 Status: Bot is currently stopped")
-
-        # System monitoring
-        with st.expander("🔍 System Monitoring"):
-            st.markdown("### System Status")
-            
-            # Display current time
-            st.write(f"🕒 Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # Bot uptime if running
-            if st.session_state.bot_running and st.session_state.get('bot_start_time'):
-                uptime = datetime.now() - st.session_state.bot_start_time
-                st.write(f"⏱️ Bot Uptime: {str(uptime).split('.')[0]}")
-            
-            # Display API status
-            try:
-                if openai.api_key and PINECONE_API_KEY and SLACK_BOT_TOKEN:
-                    st.success("✅ All API keys configured")
-                else:
-                    st.error("❌ Missing API keys")
-            except Exception:
-                st.error("❌ Error checking API configuration")
 
 def main():
     try:
@@ -488,14 +397,12 @@ def main():
             layout="wide"
         )
         
-        # Initialize the bot
         bot = LeaveBot()
         
-        # Add footer
         st.markdown("""
         ---
         <div style='text-align: center'>
-            <p>Leave Buddy Bot</p>
+            <p>Leave Buddy Bot - Developed with ❤️ | © 2024</p>
         </div>
         """, unsafe_allow_html=True)
         
