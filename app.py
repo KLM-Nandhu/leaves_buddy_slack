@@ -323,19 +323,39 @@ if uploaded_file is not None:
             st.session_state['data_uploaded'] = True
             st.sidebar.success("Data processed and uploaded successfully!")
 
+# Main interface for Slack bot controls
 st.header("Slack Bot Controls")
+
+# Initialize bot_running state if not exists
 if 'bot_running' not in st.session_state:
     st.session_state.bot_running = False
 
-if st.button("Start Slack Bot", disabled=st.session_state.bot_running):
-    st.session_state.bot_running = True
-    st.write("Starting Slack bot...")
-    thread = Thread(target=run_slack_bot)
-    thread.start()
-    st.success("Slack bot is running! You can now ask questions in your Slack channel.")
+# Create two columns for Start and Stop buttons
+col1, col2 = st.columns(2)
 
+# Start Button
+with col1:
+    if st.button("Start Slack Bot", disabled=st.session_state.bot_running):
+        st.session_state.bot_running = True
+        st.write("Starting Slack bot...")
+        thread = Thread(target=run_slack_bot)
+        thread.start()
+        st.success("Slack bot is running! You can now ask questions in your Slack channel.")
+
+# Stop Button
+with col2:
+    if st.button("Stop Slack Bot", disabled=not st.session_state.bot_running):
+        st.session_state.bot_running = False
+        st.write("Stopping Slack bot...")
+        # Force stop the bot by rerunning the page
+        st.experimental_rerun()
+        st.success("Slack bot has been stopped.")
+
+# Display bot status
 if st.session_state.bot_running:
     st.write("Slack bot is active and ready to answer queries.")
+else:
+    st.write("Slack bot is stopped.")
 
 if __name__ == "__main__":
     st.write("Leave Buddy is ready to use!")
