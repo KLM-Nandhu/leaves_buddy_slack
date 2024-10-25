@@ -107,42 +107,88 @@ async def query_pinecone(query):
         logger.error(f"Error querying Pinecone: {e}")
     return None
 
-# Function to query GPT and generate response
+# Function to extract date from query
+def extract_date_from_query(query):
+    # First, look for DD-MM-YYYY format
+    import re
+    date_pattern = r'\d{2}-\d{2}-\d{4}'
+    matches = re.findall(date_pattern, query)
+    if matches:
+        return matches[0]
+    
+    # Look for specific date mentions
+    words = query.split()
+    for word in words:
+        if word.replace('th','').replace('st','').replace('nd','').replace('rd','').isdigit():
+            # If found a day number, convert it to proper format
+            try:
+                day = int(word.replace('th','').replace('st','').replace('nd','').replace('rd',''))
+                current_date = datetime.now()
+                return current_date.replace(day=day).strftime('%d-%m-%Y')
+            except ValueError:
+                continue
+    
+    # If no date found, return today's date
+    return datetime.now().strftime('%d-%m-%Y')
+
+# Function to extract name from query
+def extract_name_from_query(query):
+    # Split query into words and look for name
+    words = query.lower().split()
+    # Skip common words
+    skip_words = {'is', 'has', 'leave', 'on', 'why', 'taking', 'today', 'tomorrow', 'yesterday'}
+    for word in words:
+        if word not in skip_words and not any(char.isdigit() for char in word):
+            return word.capitalize()
+    return None
+
+# Improved query_gpt function
 async def query_gpt(query, context):
     try:
         today = datetime.now().strftime("%d-%m-%Y")
+        name = extract_name_from_query(query)
+        date = extract_date_from_query(query)
         
         messages = [
-            {"role": "system", "content": f"""You are LeaveBuddy, an efficient AI assistant for employee leave information. Today is {today}. Follow these rules strictly:
+            {"role": "system", "content": f"""You are LeaveBuddy, a precise AI assistant for handling employee leave queries. Today is {today}. 
 
-1. Provide concise, direct answers about employee leaves.
-2. provide processing message for every request of the user.
-3. Always mention specific dates in your responses.
-4. For queries about total leave days, use this format:
-   [Employee Name] has [X] total leave days in [Year]:
-   - [Date]: [Reason]
-   - [Date]: [Reason]
-   ...
-   Total: [X] days
-5. For presence queries:
-   - If leave information is found for the date, respond with: if the information is found that person will not appear on that day
-     "[Employee Name] is present on [Date]. Reason: [Leave Reason]"
-   - If no leave information is found for the date, respond with:if the information is not found that person should appear on that day
-     "[Employee Name] is   not present on [Date]."
-6. IMPORTANT: Absence of leave information in the database means the employee is present.
-7. Only mention leave information if it's explicitly stated in the context.
-8. Limit responses to essential information only.
-9. Do not add any explanations or pleasantries.
-10. in final answer check again in DB is it correct ?
-11. if the question is overall like example : is anyboday leave today ?
-    - check the date in DB and give the solution"""},
+Key Response Rules:
+1. Answer Format Based on Query Type:
+
+   A. For "is [name] has leave on [date]" or similar queries:
+      - If leave found: "[Name] is on leave on [date] for [reason]"
+      - If no leave: "[Name] is not on leave on [date]"
+
+   B. For "why [name] taking leave on [date]" queries:
+      - If leave found: "[Name] is taking leave on [date] for [reason]"
+      - If no leave: "[Name] is not on leave on [date]"
+
+   C. For date range queries:
+      "[Name]'s leaves from [start_date] to [end_date]:
+      - [Date]: [Reason]
+      Total: [X] days"
+
+2. Critical Rules:
+   - NEVER say "present" - use "not on leave" instead
+   - Dates must be in DD-MM-YYYY format
+   - Only reference information explicitly in the context
+   - No processing messages or additional explanations
+   - Don't mention database or system checks
+   - Never repeat the same response multiple times
+   - Give direct, single-line responses
+
+3. Response Must Contain:
+   - Full date (DD-MM-YYYY)
+   - Person's name exactly as queried
+   - Clear leave status (on leave/not on leave)
+   - Reason for leave (if applicable)"""},
             {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
         ]
         
         response = await openai.ChatCompletion.acreate(
-            model="gpt-4o-mini",  # Updated to GPT-4
+            model="gpt-4o-mini",
             messages=messages,
-            max_tokens=500,
+            max_tokens=150,
             n=1,
             temperature=0.1,
         )
@@ -151,18 +197,28 @@ async def query_gpt(query, context):
         logger.error(f"Error querying GPT: {e}")
         return f"Error: Unable to process the query. Please try again."
 
-# Function to process query and generate response
+# Improved process_query function
 async def process_query(query):
     try:
         context = await query_pinecone(query)
+        name = extract_name_from_query(query)
+        date = extract_date_from_query(query)
+        
+        if not name:
+            return "Please specify the employee name in your query."
+            
         if context:
             response = await query_gpt(query, context)
         else:
-            # If no context is found, assume the employee is present
-            employee_name = query.split()[1]  # Extracts the name from "is [name] present today?"
-            today = datetime.now().strftime("%d-%m-%Y")
-            response = f"{employee_name} is present on {today}."
+            response = f"{name} is not on leave on {date}."
+            
+        # Clean up response
+        response = response.replace("  ", " ").strip()
+        if response.lower().startswith("response:"):
+            response = response[9:].strip()
+            
         return response
+        
     except Exception as e:
         logger.error(f"Error in process_query: {str(e)}")
         return "I encountered an error while processing your query. Please try again later."
@@ -174,29 +230,11 @@ async def handle_message(event, say):
         text = event.get("text", "")
         channel = event.get("channel", "")
         
-        # Send initial processing message
-        processing_message = await app.client.chat_postMessage(
-            channel=channel,
-            text="Processing your request... :hourglass_flowing_sand:"
-        )
-        
-        # Get the timestamp of the processing message
-        processing_ts = processing_message['ts']
-        
         # Process the query
         response = await process_query(text)
         
-        # Update the processing message with the final response
-        try:
-            await app.client.chat_update(
-                channel=channel,
-                ts=processing_ts,
-                text=response
-            )
-        except SlackApiError as e:
-            logger.error(f"Error updating message: {e}")
-            # If update fails, send a new message
-            await say(response)
+        # Send the response
+        await say(response)
         
     except Exception as e:
         logger.error(f"Error in handle_message: {str(e)}")
