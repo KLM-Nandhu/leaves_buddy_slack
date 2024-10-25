@@ -20,9 +20,12 @@ from langchain import LLMChain
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
-from langchain.callbacks.tracers import LangChainTracer
+from langchain.callbacks.tracers import LangChainTracer, ConsoleCallbackHandler
+from langchain.smith import RunEvalConfig
 from langchain.callbacks import tracing_enabled
 from langchain.callbacks.manager import CallbackManager
+from langsmith import Client
+import langsmith
 
 # Apply nest_asyncio
 nest_asyncio.apply()
@@ -56,18 +59,23 @@ os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = get_secret("LANGCHAIN_API_KEY")
 os.environ["LANGCHAIN_PROJECT"] = "Leaves-Buddy"
 
-# Initialize LangChain tracer
+# Initialize LangSmith client
+langsmith_client = Client()
+
+# Initialize tracers
+console_handler = ConsoleCallbackHandler()
 tracer = LangChainTracer(
-    project_name="Leaves-Buddy"
+    project_name="Leaves-Buddy",
+    client=langsmith_client
 )
 
-# Initialize ChatOpenAI with optimized settings
+# Initialize ChatOpenAI with tracing
 llm = ChatOpenAI(
     model_name="gpt-4o-mini",
     temperature=0.1,
     streaming=False,
     request_timeout=10,
-    callback_manager=CallbackManager([tracer])
+    callbacks=[console_handler, tracer]
 )
 
 # Initialize Pinecone
@@ -76,6 +84,78 @@ index_name = "annual-leave"
 
 # Initialize Slack
 app = AsyncApp(token=SLACK_BOT_TOKEN)
+
+SYSTEM_PROMPT = """You are LeaveBuddy, a precise leave management assistant. Today is {current_date}. Follow these rules exactly:
+
+1. DATA ACCURACY:
+   - Only use leave information explicitly present in the context
+   - Never make assumptions about leaves not in the data
+   - Always verify dates, names, and reasons before responding
+   - If a person is not shown as on leave for a date, they are present
+
+2. QUERY HANDLING:
+   For individual queries ("is [name] on leave?"):
+   - Check exact dates in context
+   - Response format: "[Name] is on leave on [Date] for [Festival]" or "[Name] is present on [Date]"
+
+3. MULTIPLE EMPLOYEE QUERIES:
+   When asked about multiple people:
+   - List each person separately
+   - Show all leave dates for each person
+   - Compare any overlapping leaves
+   - Format:
+     [Name1]:
+     - [Date]: [Festival]
+     - [Date]: [Festival]
+     [Name2]:
+     - [Date]: [Festival]
+
+4. DATE VERIFICATION:
+   - Use exact DD-MM-YYYY format
+   - Include day of week if available
+   - For future dates, explicitly check if leave is scheduled
+
+5. ERROR HANDLING:
+   If information is missing:
+   - Name not found: "No records found for [Name]"
+   - Date not found: "No leave information for that date"
+   - Unclear query: "Could you please specify the name and date?"
+
+6. COMPARATIVE ANALYSIS:
+   When comparing leaves:
+   - List all relevant dates
+   - Note overlapping leaves
+   - Highlight any differences
+
+7. RESPONSE STRUCTURE:
+   - Start with "Processing request..."
+   - Provide clear, direct answers
+   - Use bullet points for multiple items
+   - End with verification statement
+
+8. VERIFICATION:
+   - Double-check all dates and names
+   - Verify festival/reason matches
+   - Ensure response matches context exactly
+   
+9. FORMAT RULES:
+   - Always show dates as DD-MM-YYYY
+   - Include weekday when available
+   - Show total leave count at the end
+   - List leaves chronologically
+   - Use clear sections for past and future leaves
+   - Include emojis for better readability:
+     📅 for dates
+     ✓ for completed leaves
+     🗓 for upcoming leaves
+     ❌ for no leaves
+     👥 for multiple people
+
+Remember:
+1. Be precise and accurate
+2. Only use information from the provided context
+3. Always verify before responding
+4. Keep responses complete and well-structured"""
 
 class LeaveBot:
     def __init__(self):
@@ -101,19 +181,31 @@ class LeaveBot:
 
     def setup_langchain(self):
         self.prompt_template = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""You are LeaveBuddy, a leave management assistant. Be direct and brief.
-1. For individual queries: State if person is on leave or present
-2. For multiple people: List each person's status
-3. Always verify dates
-4. Be concise"""),
+            SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content="{query}")
         ])
         
         self.chain = LLMChain(
             llm=llm,
             prompt=self.prompt_template,
-            verbose=True
+            verbose=True,
+            callbacks=[console_handler, tracer]
         )
+
+    def check_langsmith_connection(self):
+        try:
+            projects = langsmith_client.list_projects()
+            current_project = next((p for p in projects if p.name == "Leaves-Buddy"), None)
+            
+            if current_project:
+                self.update_log("✅ LangSmith connected successfully")
+                return True
+            else:
+                self.update_log("❌ LangSmith project not found")
+                return False
+        except Exception as e:
+            self.update_log(f"❌ LangSmith connection error: {str(e)}")
+            return False
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -216,52 +308,72 @@ class LeaveBot:
 
     async def query_gpt(self, query, context):
         try:
-            today = datetime.now().strftime("%d-%m-%Y")
-            
-            messages = [
-                {"role": "system", "content": """You are LeaveBuddy, a leave management assistant. Be direct and brief.
-1. For individual queries: State if person is on leave or present
-2. For multiple people: List each person's status
-3. Always verify dates in context
-4. Be concise"""},
-                {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
-            ]
-            
-            response = await openai.ChatCompletion.acreate(
-                model="gpt-3.5-turbo",
-                messages=messages,
-                max_tokens=150,
-                temperature=0.1,
-                presence_penalty=0.0,
-                frequency_penalty=0.0
-            )
-            return response.choices[0].message['content'].strip()
+            with tracing_enabled() as session:
+                today = datetime.now().strftime("%d-%m-%Y")
+                
+                session.metadata = {
+                    "query_type": "leave_query",
+                    "timestamp": today,
+                    "has_context": bool(context)
+                }
+                
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT.format(current_date=today)},
+                    {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
+                ]
+                
+                response = await openai.ChatCompletion.acreate(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=500,
+                    temperature=0.1,
+                    presence_penalty=0.0,
+                    frequency_penalty=0.0
+                )
+                
+                session.log({
+                    "response": response.choices[0].message['content'],
+                    "model": "gpt-4o-mini",
+                    "total_tokens": response.usage.total_tokens if hasattr(response, 'usage') else None
+                })
+                
+                return response.choices[0].message['content'].strip()
         except Exception as e:
             logger.error(f"GPT query error: {e}")
             return f"Error processing query. Please try again."
 
     async def process_query(self, query):
         try:
-            today = datetime.now().strftime("%d-%m-%Y")
-            
-            if query.lower().startswith("is "):
-                name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
-                if name_match:
-                    name = name_match.group(1)
-                    context = await self.query_pinecone(query)
-                    if context and name.lower() in context.lower():
-                        response = await self.query_gpt(query, context)
-                    else:
-                        return f"{name} is present today (no leave records found)."
-                    return response
-
-            context = await self.query_pinecone(query)
-            if context:
-                response = await self.query_gpt(query, context)
-                return response
-            else:
-                return "No relevant leave information found."
+            with tracing_enabled() as session:
+                session.metadata = {
+                    "query_text": query,
+                    "timestamp": datetime.now().isoformat()
+                }
                 
+                today = datetime.now().strftime("%d-%m-%Y")
+                
+                if query.lower().startswith("is "):
+                    name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
+                    if name_match:
+                        name = name_match.group(1)
+                        context = await self.query_pinecone(query)
+                        session.log({"found_context": bool(context)})
+                        
+                        if context and name.lower() in context.lower():
+                            response = await self.query_gpt(query, context)
+                        else:
+                            response = f"{name} is present today (no leave records found)."
+                        return response
+
+                context = await self.query_pinecone(query)
+                session.log({"found_context": bool(context)})
+                
+                if context:
+                    response = await self.query_gpt(query, context)
+                    return response
+                else:
+                    return "No relevant leave information found."
+                    
         except Exception as e:
             logger.error(f"Query processing error: {e}")
             return "An error occurred. Please try again."
@@ -270,32 +382,48 @@ class LeaveBot:
         @app.event("message")
         async def handle_message(event, say):
             try:
-                text = event.get("text", "")
-                channel = event.get("channel", "")
-                
-                processing_message = await app.client.chat_postMessage(
-                    channel=channel,
-                    text="Processing..."
-                )
-                
-                try:
-                    response = await asyncio.wait_for(
-                        self.process_query(text),
-                        timeout=10.0
-                    )
-                except asyncio.TimeoutError:
-                    response = "Request timed out. Please try again."
-                
-                try:
-                    await app.client.chat_update(
+                with tracing_enabled() as session:
+                    text = event.get("text", "")
+                    channel = event.get("channel", "")
+                    
+                    session.metadata = {
+                        "channel": channel,
+                        "message_type": "slack_query",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+                    processing_message = await app.client.chat_postMessage(
                         channel=channel,
-                        ts=processing_message['ts'],
-                        text=response
+                        text="🤖 Processing your request... :hourglass_flowing_sand:"
                     )
-                except SlackApiError as e:
-                    logger.error(f"Slack API error: {e}")
-                    await say(response)
-                
+                    
+                    try:
+                        response = await asyncio.wait_for(
+                            self.process_query(text),
+                            timeout=10.0
+                        )
+                        
+                        session.log({
+                            "status": "success",
+                            "response_time": time.time(),
+                            "response_length": len(response)
+                        })
+                        
+                    except asyncio.TimeoutError:
+                        response = "Request timed out. Please try again."
+                        session.log({"status": "timeout"})
+                    
+                    try:
+                        await app.client.chat_update(
+                            channel=channel,
+                            ts=processing_message['ts'],
+                            text=response
+                        )
+                    except SlackApiError as e:
+                        logger.error(f"Slack API error: {e}")
+                        await say(response)
+                        session.log({"status": "slack_api_error"})
+                    
             except Exception as e:
                 error_msg = f"Message handling error: {str(e)}"
                 logger.error(error_msg)
@@ -384,10 +512,54 @@ class LeaveBot:
                 st.warning("⚠️ Bot has been stopped")
                 st.rerun()
 
-        if st.session_state.bot_running:
-            st.success("🟢 Status: Active and ready for queries")
-        else:
-            st.warning("🔴 Status: Bot is currently stopped")
+        # System status and monitoring
+        with st.expander("🔍 System Monitoring"):
+            st.markdown("### System Status")
+            
+            # Display current time
+            st.write(f"🕒 Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # Bot uptime if running
+            if st.session_state.bot_running and st.session_state.get('bot_start_time'):
+                uptime = datetime.now() - st.session_state.bot_start_time
+                st.write(f"⏱️ Bot Uptime: {str(uptime).split('.')[0]}")
+            
+            # Check API configurations
+            st.markdown("### API Status")
+            apis_ok = True
+            
+            # Check OpenAI
+            if openai.api_key:
+                st.success("✅ OpenAI API Connected")
+            else:
+                st.error("❌ OpenAI API Key Missing")
+                apis_ok = False
+            
+            # Check Pinecone
+            if PINECONE_API_KEY:
+                st.success("✅ Pinecone API Connected")
+            else:
+                st.error("❌ Pinecone API Key Missing")
+                apis_ok = False
+            
+            # Check Slack
+            if SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
+                st.success("✅ Slack API Connected")
+            else:
+                st.error("❌ Slack API Keys Missing")
+                apis_ok = False
+            
+            # Check LangSmith
+            if self.check_langsmith_connection():
+                st.success("✅ LangSmith Connected")
+            else:
+                st.error("❌ LangSmith Connection Failed")
+                apis_ok = False
+            
+            if apis_ok:
+                st.success("✅ All Systems Operational")
+            else:
+                st.warning("⚠️ Some Systems Need Attention")
 
 def main():
     try:
