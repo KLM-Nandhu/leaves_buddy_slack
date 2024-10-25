@@ -16,6 +16,14 @@ import os
 from dotenv import load_dotenv
 import nest_asyncio
 import re
+from langchain import LLMChain
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema import SystemMessage, HumanMessage
+from langchain.callbacks.tracers import LangChainTracer
+from langchain.smith import RunEvalConfig
+from langchain.callbacks import tracing_enabled
+from langchain.callbacks.manager import CallbackManager
 
 # Apply nest_asyncio
 nest_asyncio.apply()
@@ -43,6 +51,25 @@ PINECONE_API_KEY = get_secret("PINECONE_API_KEY")
 SLACK_BOT_TOKEN = get_secret("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = get_secret("SLACK_APP_TOKEN")
 
+# LangSmith configuration
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+os.environ["LANGCHAIN_API_KEY"] = get_secret("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = "Leaves-Buddy"
+
+# Initialize LangChain tracer
+tracer = LangChainTracer(
+    project_name="Leaves-Buddy"
+)
+
+# Initialize ChatOpenAI with tracing
+llm = ChatOpenAI(
+    model_name="gpt-4o-mini",
+    temperature=0.1,
+    streaming=True,
+    callback_manager=CallbackManager([tracer])
+)
+
 # Initialize Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index_name = "annual-leave"
@@ -54,7 +81,8 @@ class LeaveBot:
     def __init__(self):
         self.initialize_state()
         self.setup_ui()
-        
+        self.setup_langchain()
+
     def initialize_state(self):
         if 'bot_running' not in st.session_state:
             st.session_state.bot_running = False
@@ -70,6 +98,43 @@ class LeaveBot:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         st.session_state.logs = f"[{timestamp}] {message}\n" + st.session_state.logs
         self.log_placeholder.text_area("System Logs", st.session_state.logs, height=300)
+
+    def setup_langchain(self):
+        self.prompt_template = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""You are LeaveBuddy, a precise leave management assistant. Today is {current_time}. Follow these rules exactly:
+
+1. RESPONSE STRUCTURE:
+   - Start with "🤖 Processing request..."
+   - Show time period
+   - List leaves chronologically
+   - Include total counts
+
+2. FORMATTING:
+   - Use DD-MM-YYYY for dates
+   - Include days of week
+   - Use emojis for clarity
+   - Separate past and future leaves
+
+3. SPECIAL CASES:
+   - Show "No leaves found" if none exist
+   - Mark overlapping leaves
+   - Note holidays and weekends
+
+4. ACCURACY:
+   - Verify all dates
+   - Double-check counts
+   - Ensure complete responses
+
+Context: {context}
+"""),
+            HumanMessage(content="{query}")
+        ])
+        
+        self.chain = LLMChain(
+            llm=llm,
+            prompt=self.prompt_template,
+            verbose=True
+        )
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -102,16 +167,12 @@ class LeaveBot:
 
     def create_structured_text(self, row):
         leave_status = self.get_leave_status(row['DATE'])
-        
         return (
             f"{row['NAME']} has leave ({leave_status}) on {row['DATE']} ({row['DAY']}) "
             f"for {row['FESTIVALS']}. This leave is in {row['MONTH']} {row['YEAR']}. "
             f"Status: {leave_status}. Type: {row['FESTIVALS']}. "
             f"Details: {row['NAME']} will be on leave on {row['DAY']}, {row['DATE']} "
-            f"for {row['FESTIVALS']} celebration/observation. "
-            f"This is a {row['FESTIVALS']} holiday in {row['MONTH']} {row['YEAR']}. "
-            f"Leave Status: {leave_status}. Employee Name: {row['NAME']}. "
-            f"Date Information: {row['DATE']} ({row['DAY']})."
+            f"for {row['FESTIVALS']} celebration/observation."
         )
 
     def create_embeddings(self, df):
@@ -172,26 +233,9 @@ class LeaveBot:
                     key=lambda x: datetime.strptime(x['metadata']['date'], '%d-%m-%Y')
                 )
                 
-                completed = []
-                scheduled = []
-                current = []
-                
-                for match in matches:
-                    status = match['metadata'].get('status', '')
-                    if status == 'Completed':
-                        completed.append(match['metadata']['text'])
-                    elif status == 'Scheduled':
-                        scheduled.append(match['metadata']['text'])
-                    elif status == 'Current':
-                        current.append(match['metadata']['text'])
-                
                 context_parts = []
-                if completed:
-                    context_parts.append("COMPLETED LEAVES: " + " ".join(completed))
-                if current:
-                    context_parts.append("CURRENT LEAVES: " + " ".join(current))
-                if scheduled:
-                    context_parts.append("SCHEDULED LEAVES: " + " ".join(scheduled))
+                for match in matches:
+                    context_parts.append(match['metadata']['text'])
                 
                 return " | ".join(context_parts)
             return None
@@ -201,125 +245,69 @@ class LeaveBot:
 
     async def query_gpt(self, query, context):
         try:
-            today = datetime.now().strftime("%d-%m-%Y")
-            
-            messages = [
-                {"role": "system", "content": f"""You are LeaveBuddy, a precise leave management assistant. Today is {today}. Follow these rules exactly:
-
-1. QUERY ANALYSIS:
-   - Carefully analyze if query is about past, present, or future dates
-   - Identify single or multiple employee requests
-   - Determine if date-specific or general inquiry
-   - Check if asking for comparison or individual status
-
-2. RESPONSE FORMAT:
-   Always structure as follows:
-   
-   🤖 Processing request...
-   
-   📅 Time Period: [Past/Present/Future]
-   
-   RESULTS:
-   [Employee Name]
-   ✓ Completed Leaves:
-   - DD-MM-YYYY ([Day]): [Festival]
-   
-   📍 Current Status:
-   - [Present/On Leave] Today
-   
-   🗓 Scheduled Leaves:
-   - DD-MM-YYYY ([Day]): [Festival]
-   
-   📊 Summary:
-   - Total Past Leaves: X
-   - Total Scheduled Leaves: Y
-   - Total Days: Z
-
-3. COMPARISON FORMAT:
-   When comparing employees:
-   
-   COMPARATIVE ANALYSIS:
-   📋 Common Leaves:
-   - [Date]: [Festival] (Employees: [Names])
-   
-   🔄 Individual Patterns:
-   [Name1]:
-   - Unique leaves: [Dates]
-   [Name2]:
-   - Unique leaves: [Dates]
-   
-   📈 Statistics:
-   - Most leaves: [Name]
-   - Upcoming leaves: [Count] per person
-
-4. RULES:
-   - Always show exact dates (DD-MM-YYYY)
-   - Include day of week when available
-   - Use emojis for better readability
-   - Sort leaves chronologically
-   - Separate past and future leaves
-   - Show total leave counts
-   - Verify all data matches context
-   - Complete all responses fully
-   - Never cut off mid-response
-
-5. SPECIAL HANDLING:
-   - No data: "No leave records found for [Name]"
-   - Partial data: "Showing available records for [Date Range]"
-   - Invalid queries: "Please specify [missing info]"
-   - Multiple names: List each person separately
-   - Date conflicts: Show all overlapping leaves
-
-6. VERIFICATION STEPS:
-   - Cross-check all dates
-   - Verify festival names
-   - Confirm employee names
-   - Double-check leave counts
-   - Ensure response completeness
-
-Remember: Every response must be complete, accurate, and well-formatted with all relevant information."""},
-                {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
-            ]
-            
-            response = await openai.ChatCompletion.acreate(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=1000,
-                n=1,
-                temperature=0.1,
-                presence_penalty=0.6,
-                frequency_penalty=0.3
-            )
-            return response.choices[0].message['content'].strip()
+            with tracing_enabled() as session:
+                inputs = {
+                    "query": query,
+                    "context": context,
+                    "current_time": datetime.now().strftime("%d-%m-%Y")
+                }
+                
+                response = await self.chain.arun(
+                    inputs,
+                    metadata={
+                        "conversation_id": str(session.id),
+                        "query_type": "leave_query",
+                        "has_context": bool(context)
+                    }
+                )
+                
+                return response.strip()
         except Exception as e:
             logger.error(f"GPT query error: {e}")
             return f"Error processing query. Please try again."
 
     async def process_query(self, query):
         try:
-            logger.info(f"Processing query: {query}")
-            context = await self.query_pinecone(query)
-            
-            if context:
-                logger.info(f"Found context: {context[:200]}...")
-                response = await self.query_gpt(query, context)
-                logger.info(f"Generated response: {response}")
-                return response
-            else:
-                name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
-                if name_match:
-                    name = name_match.group(1)
-                    today = datetime.now().strftime("%d-%m-%Y")
-                    return (
-                        f"🤖 Processing request...\n\n"
-                        f"📅 Date: {today}\n\n"
-                        f"RESULTS:\n"
-                        f"{name} is present today (no leave records found).\n\n"
-                        f"📊 Summary:\n"
-                        f"- No leave records found for specified date"
-                    )
+            with tracing_enabled() as session:
+                logger.info(f"Processing query: {query}")
+                
+                metadata = {
+                    "conversation_id": str(session.id),
+                    "query_type": "leave_request",
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                context = await self.query_pinecone(query)
+                
+                if context:
+                    logger.info(f"Found context: {context[:200]}...")
+                    response = await self.query_gpt(query, context)
+                    metadata.update({
+                        "status": "success",
+                        "has_context": True
+                    })
+                    return response
                 else:
-                    return "Please provide a specific employee name or date for leave information."
+                    name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
+                    if name_match:
+                        name = name_match.group(1)
+                        today = datetime.now().strftime("%d-%m-%Y")
+                        response = (
+                            f"🤖 Processing request...\n\n"
+                            f"📅 Date: {today}\n\n"
+                            f"RESULTS:\n"
+                            f"{name} is present today (no leave records found).\n\n"
+                            f"📊 Summary:\n"
+                            f"- No leave records found for specified date"
+                        )
+                        metadata.update({
+                            "status": "success",
+                            "has_context": False
+                        })
+                        return response
+                    else:
+                        metadata["status"] = "invalid_query"
+                        return "Please provide a specific employee name or date for leave information."
         except Exception as e:
             logger.error(f"Query processing error: {e}")
             return "An error occurred. Please try again."
@@ -375,7 +363,6 @@ Remember: Every response must be complete, accurate, and well-formatted with all
     def setup_ui(self):
         st.title("Leave Buddy - Slack Bot")
         
-        # Sidebar
         st.sidebar.header("📤 Update Leave Data")
         uploaded_file = st.sidebar.file_uploader("Upload Excel file", type="xlsx")
         
@@ -416,14 +403,11 @@ Remember: Every response must be complete, accurate, and well-formatted with all
                 self.update_log(f"❌ {error_msg}")
                 st.sidebar.error(f"❌ {error_msg}")
 
-        # Main interface
         st.header("🤖 Slack Bot Controls")
         
-        # Display last update time
         if st.session_state.last_update:
             st.info(f"📅 Last data update: {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Bot control buttons
         col1, col2 = st.columns(2)
         
         with col1:
@@ -511,7 +495,7 @@ def main():
         st.markdown("""
         ---
         <div style='text-align: center'>
-            <p>Leave Buddy Bot - Developed with ❤️ | © 2024</p>
+            <p>Leave Buddy Bot</p>
         </div>
         """, unsafe_allow_html=True)
         
