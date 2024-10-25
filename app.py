@@ -16,6 +16,12 @@ import os
 from dotenv import load_dotenv
 import nest_asyncio
 import re
+from langsmith import Client
+from langchain.callbacks.tracers import LangSmithTracer
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import LLMChain
+from langchain.prompts import ChatPromptTemplate
+from langchain.embeddings import OpenAIEmbeddings
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -23,37 +29,24 @@ nest_asyncio.apply()
 # Load environment variables
 load_dotenv()
 
-# Set up logging with more detail
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables from Streamlit secrets or .env file
-def get_secret(key):
-    try:
-        return st.secrets[key]
-    except:
-        return os.getenv(key)
-
-# Initialize API keys
-openai.api_key = get_secret("OPENAI_API_KEY")
-PINECONE_API_KEY = get_secret("PINECONE_API_KEY")
-SLACK_BOT_TOKEN = get_secret("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = get_secret("SLACK_APP_TOKEN")
-
-# Initialize Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index_name = "annual-leave"
-
-# Initialize Slack app
-app = AsyncApp(token=SLACK_BOT_TOKEN)
+# Default configurations
+DEFAULT_INDEX_NAME = "annual-leave"
+DEFAULT_LANGCHAIN_PROJECT = "Leaves-Buddy-slack"
+DEFAULT_LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
 
 class LeaveBot:
     def __init__(self):
         self.initialize_state()
         self.setup_ui()
+        self.setup_langsmith()
+        self.setup_embeddings()
         
     def initialize_state(self):
         if 'bot_running' not in st.session_state:
@@ -64,20 +57,78 @@ class LeaveBot:
             st.session_state.last_update = None
         self.log_placeholder = st.empty()
 
+    def setup_embeddings(self):
+        self.embeddings = OpenAIEmbeddings(callbacks=[self.tracer])
+
+    def setup_langsmith(self):
+        # Set LangChain environment variables
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_ENDPOINT"] = DEFAULT_LANGCHAIN_ENDPOINT
+        os.environ["LANGCHAIN_PROJECT"] = DEFAULT_LANGCHAIN_PROJECT
+        
+        # Initialize tracer with default project
+        self.tracer = LangSmithTracer(project_name=DEFAULT_LANGCHAIN_PROJECT)
+        self.llm = ChatOpenAI(
+            model_name="gpt-4o-mini",
+            temperature=0.1,
+            callbacks=[self.tracer]
+        )
+        
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", self.get_system_prompt()),
+            ("human", "{query}\n\nContext: {context}")
+        ])
+        
+        self.chain = LLMChain(
+            llm=self.llm,
+            prompt=self.prompt,
+            callbacks=[self.tracer]
+        )
+
+    @staticmethod
+    def get_secret(key):
+        """Get secret from Streamlit secrets or environment variables"""
+        try:
+            return st.secrets[key]
+        except:
+            return os.getenv(key)
+
+    def get_system_prompt(self):
+        """Get the detailed system prompt for the LLM"""
+        today = datetime.now().strftime("%d-%m-%Y")
+        return f"""You are LeaveBuddy, a precise leave management assistant. Today is {today}. 
+        
+Your primary tasks are:
+1. Answer questions about employee leave schedules
+2. Check who is on leave on specific dates
+3. Provide leave information for specific employees
+4. Help with leave planning and team availability
+
+When responding:
+1. Use only information from the provided context
+2. Be precise with dates (use DD-MM-YYYY format)
+3. Include the reason/festival for leaves
+4. Clearly state if information is not available
+
+For leave queries:
+- Individual: "[Name] is on leave on [Date] for [Reason]"
+- Date-based: List all employees on leave for that date
+- Period queries: Group by date and list employees
+- Team queries: Show overlapping leaves and availability
+
+Always verify:
+- Exact dates
+- Employee names
+- Leave reasons/festivals
+- Data accuracy
+
+Keep responses clear, concise, and accurate."""
+
     def update_log(self, message):
+        """Update the log display with new messages"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         st.session_state.logs = f"[{timestamp}] {message}\n" + st.session_state.logs
         self.log_placeholder.text_area("Logs", st.session_state.logs, height=300)
-
-    @staticmethod
-    @lru_cache(maxsize=1000)
-    def get_embedding(text):
-        try:
-            response = openai.Embedding.create(input=text, model="text-embedding-ada-002")
-            return tuple(response['data'][0]['embedding'])
-        except Exception as e:
-            logger.error(f"Error generating embedding: {e}")
-            return None
 
     def create_structured_text(self, row):
         """Create a well-structured text representation of leave data"""
@@ -85,15 +136,15 @@ class LeaveBot:
             f"{row['NAME']} has leave scheduled for {row['DATE']} ({row['DAY']}) "
             f"for {row['FESTIVALS']}. This leave is in {row['MONTH']} {row['YEAR']}. "
             f"The day is a {row['DAY']}. Festival/Event: {row['FESTIVALS']}. "
-            f"Employee: {row['NAME']}. Full date: {row['DATE']}. "
-            f"This is a {row['FESTIVALS']} holiday."
+            f"Employee: {row['NAME']}. Full date: {row['DATE']}."
         )
 
     def create_embeddings(self, df):
+        """Create embeddings for all leave records"""
         records = []
         for i, row in df.iterrows():
             text = self.create_structured_text(row)
-            embedding = self.get_embedding(text)
+            embedding = self.embeddings.embed_query(text)
             if embedding:
                 records.append((
                     str(i),
@@ -111,6 +162,7 @@ class LeaveBot:
         return records
 
     def upload_to_pinecone(self, records):
+        """Upload records to Pinecone index"""
         try:
             if index_name not in pc.list_indexes().names():
                 pc.create_index(
@@ -131,13 +183,11 @@ class LeaveBot:
             return False, f"Error uploading data to Pinecone: {str(e)}"
 
     async def query_pinecone(self, query):
+        """Query Pinecone for relevant leave records"""
         try:
             index = pc.Index(index_name)
-            query_embedding = self.get_embedding(query)
-            if query_embedding is None:
-                return None
-                
-            # Increase top_k for better context
+            query_embedding = self.embeddings.embed_query(query)
+            
             results = index.query(
                 vector=query_embedding,
                 top_k=10,
@@ -145,7 +195,6 @@ class LeaveBot:
             )
             
             if results['matches']:
-                # Sort matches by date for chronological order
                 matches = sorted(
                     results['matches'],
                     key=lambda x: datetime.strptime(x['metadata']['date'], '%d-%m-%Y')
@@ -157,107 +206,23 @@ class LeaveBot:
             logger.error(f"Error querying Pinecone: {e}")
             return None
 
-    def parse_date(self, date_str):
-        """Parse date string to consistent format"""
-        try:
-            return datetime.strptime(date_str, '%d-%m-%Y')
-        except ValueError:
-            return None
-
-    async def query_gpt(self, query, context):
-        try:
-            today = datetime.now().strftime("%d-%m-%Y")
-            
-            messages = [
-                {"role": "system", "content": f"""You are LeaveBuddy, a precise leave management assistant. Today is {today}. Follow these rules exactly:
-
-1. DATA ACCURACY:
-   - Only use leave information explicitly present in the context
-   - Never make assumptions about leaves not in the data
-   - Always verify dates, names, and reasons before responding
-   - If a person is not shown as on leave for a date, they are present
-
-2. QUERY HANDLING:
-   For individual queries ("is [name] on leave?"):
-   - Check exact dates in context
-   - Response format: "[Name] is on leave on [Date] for [Festival]" or "[Name] is present on [Date]"
-
-3. MULTIPLE EMPLOYEE QUERIES:
-   When asked about multiple people:
-   - List each person separately
-   - Show all leave dates for each person
-   - Compare any overlapping leaves
-   - Format:
-     [Name1]:
-     - [Date]: [Festival]
-     - [Date]: [Festival]
-     [Name2]:
-     - [Date]: [Festival]
-
-4. DATE VERIFICATION:
-   - Use exact DD-MM-YYYY format
-   - Include day of week if available
-   - For future dates, explicitly check if leave is scheduled
-
-5. ERROR HANDLING:
-   If information is missing:
-   - Name not found: "No records found for [Name]"
-   - Date not found: "No leave information for that date"
-   - Unclear query: "Could you please specify the name and date?"
-
-6. COMPARATIVE ANALYSIS:
-   When comparing leaves:
-   - List all relevant dates
-   - Note overlapping leaves
-   - Highlight any differences
-
-7. RESPONSE STRUCTURE:
-   - Start with "Processing request..."
-   - Provide clear, direct answers
-   - Use bullet points for multiple items
-   - End with verification statement
-
-8. VERIFICATION:
-   - Double-check all dates and names
-   - Verify festival/reason matches
-   - Ensure response matches context exactly"""},
-                {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
-            ]
-            
-            response = await openai.ChatCompletion.acreate(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=200,
-                n=1,
-                temperature=0.1  # Low temperature for consistent responses
-            )
-            return response.choices[0].message['content'].strip()
-        except Exception as e:
-            logger.error(f"Error querying GPT: {e}")
-            return f"Error: Unable to process the query. Please try again."
-
     async def process_query(self, query):
+        """Process a leave-related query and return a response"""
         try:
-            # Log the incoming query
             logger.info(f"Processing query: {query}")
             
-            # Get context from Pinecone
             context = await self.query_pinecone(query)
             
             if context:
-                # Log the context found
                 logger.info(f"Context found: {context[:200]}...")
                 
-                # Get response from GPT
-                response = await self.query_gpt(query, context)
+                response = await self.chain.acall({
+                    "query": query,
+                    "context": context
+                })
                 
-                # Log the response
-                logger.info(f"Generated response: {response}")
-                
-                return response
+                return response['text']
             else:
-                # Handle case when no context is found
-                # Extract name from query if possible
                 name_match = re.search(r"is (\w+)", query, re.IGNORECASE)
                 if name_match:
                     name = name_match.group(1)
@@ -270,6 +235,7 @@ class LeaveBot:
             return "I encountered an error while processing your query. Please try again later."
 
     def setup_slack_handlers(self):
+        """Set up Slack event handlers"""
         @app.event("message")
         async def handle_message(event, say):
             try:
@@ -282,26 +248,25 @@ class LeaveBot:
                     text="Processing your request... :hourglass_flowing_sand:"
                 )
                 
-                # Log the request
                 self.update_log(f"Received query: {text}")
                 
-                # Process the query
                 response = await self.process_query(text)
                 
-                # Update the message with the response
-                try:
-                    await app.client.chat_update(
-                        channel=channel,
-                        ts=processing_message['ts'],
-                        text=response
-                    )
-                    
-                    # Log the successful response
-                    self.update_log(f"Responded: {response}")
-                    
-                except SlackApiError as e:
-                    logger.error(f"Error updating message: {e}")
-                    await say(response)
+                if response:
+                    try:
+                        await app.client.chat_update(
+                            channel=channel,
+                            ts=processing_message['ts'],
+                            text=response
+                        )
+                        
+                        self.update_log(f"Responded: {response}")
+                        
+                    except SlackApiError as e:
+                        logger.error(f"Error updating message: {e}")
+                        await say(response)
+                else:
+                    await say("I'm sorry, I couldn't process your request. Please try again.")
                     
             except Exception as e:
                 error_msg = f"Error in handle_message: {str(e)}"
@@ -310,10 +275,12 @@ class LeaveBot:
                 await say("I'm sorry, I encountered an error. Please try again.")
 
     async def run_slack_bot(self):
+        """Run the Slack bot"""
         handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
         await handler.start_async()
 
     def start_bot_forever(self):
+        """Start the bot in a continuous loop"""
         while True:
             try:
                 loop = asyncio.new_event_loop()
@@ -326,10 +293,10 @@ class LeaveBot:
                 time.sleep(5)
 
     def setup_ui(self):
+        """Set up the Streamlit user interface"""
         st.title("Leave Buddy - Slack Bot")
         
-        # Sidebar for data upload
-        st.sidebar.header("Update Leave Data")
+        st.sidebar.header("Upload Leave Data")
         uploaded_file = st.sidebar.file_uploader("Upload Excel file", type="xlsx")
         
         if uploaded_file is not None:
@@ -337,12 +304,10 @@ class LeaveBot:
                 df = pd.read_excel(uploaded_file)
                 required_columns = ['NAME', 'YEAR', 'MONTH', 'DATE', 'DAY', 'FESTIVALS']
                 
-                # Validate columns
                 if not all(col in df.columns for col in required_columns):
                     st.sidebar.error("Excel file must contain all required columns: " + ", ".join(required_columns))
                     return
                 
-                # Convert date to consistent format
                 df['DATE'] = pd.to_datetime(df['DATE']).dt.strftime('%d-%m-%Y')
                 
                 st.sidebar.write("Uploaded Data Preview:")
@@ -350,11 +315,9 @@ class LeaveBot:
                 
                 if st.sidebar.button("Process and Upload Data"):
                     with st.spinner("Processing and uploading data..."):
-                        # Create embeddings
                         self.update_log("Creating embeddings...")
                         embeddings = self.create_embeddings(df)
                         
-                        # Upload to Pinecone
                         self.update_log("Uploading to Pinecone...")
                         success, message = self.upload_to_pinecone(embeddings)
                         
@@ -373,29 +336,63 @@ class LeaveBot:
                 self.update_log(error_msg)
                 st.sidebar.error(error_msg)
 
-        # Main interface
-        st.header("Slack Bot Controls")
+        st.header("Bot Controls")
         
-        # Show last update time if available
         if st.session_state.last_update:
             st.info(f"Last data update: {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        if st.button("Start Slack Bot", disabled=st.session_state.bot_running):
-            st.session_state.bot_running = True
-            st.write("Starting Slack bot...")
-            self.setup_slack_handlers()
-            thread = Thread(target=self.start_bot_forever, daemon=True)
-            thread.start()
-            st.success("Slack bot is running! You can now ask questions in your Slack channel.")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("Start Bot", disabled=st.session_state.bot_running):
+                st.session_state.bot_running = True
+                st.write("Starting Slack bot...")
+                self.setup_slack_handlers()
+                thread = Thread(target=self.start_bot_forever, daemon=True)
+                thread.start()
+                st.success("Bot is running! You can now ask questions in Slack.")
 
-        if st.session_state.bot_running:
-            st.write("Status: Active and ready for queries")
-            if st.button("Stop Bot"):
+        with col2:
+            if st.session_state.bot_running and st.button("Stop Bot"):
                 st.session_state.bot_running = False
                 st.experimental_rerun()
 
 def main():
-    bot = LeaveBot()
+    """Initialize and run the LeaveBot application"""
+    try:
+        # Initialize only the required API keys
+        required_keys = [
+            "OPENAI_API_KEY",
+            "PINECONE_API_KEY",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+            "LANGCHAIN_API_KEY"
+        ]
+        
+        # Check for required API keys
+        missing_keys = [key for key in required_keys if not LeaveBot.get_secret(key)]
+        if missing_keys:
+            st.error(f"Missing required API keys: {', '.join(missing_keys)}")
+            st.info("Please add the missing API keys to your .env file or Streamlit secrets.")
+            return
+            
+        # Initialize global variables
+        global pc, index_name, app
+        
+        # Set up Pinecone with default index name
+        pc = Pinecone(api_key=LeaveBot.get_secret("PINECONE_API_KEY"))
+        index_name = annual-leave
+        
+        # Set up Slack app
+        app = AsyncApp(token=LeaveBot.get_secret("SLACK_BOT_TOKEN"))
+        
+        # Create and run the bot
+        bot = LeaveBot()
+        
+    except Exception as e:
+        st.error(f"Error initializing the application: {str(e)}")
+        logger.error(f"Initialization error: {str(e)}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
